@@ -20,27 +20,44 @@ const vm = require('node:vm');
 const inspector = require('node:inspector');
 const v8 = require('node:v8');
 const { fileURLToPath } = require('node:url');
-const { cacheForRuntime, createSandbox, runModuleWrapper } = require('./electron_v8_extract.cjs');
+const {
+  cacheForRuntime,
+  createSandbox,
+  runModuleWrapper,
+  discoverReturnedFunctions,
+  createTraceSink
+} = require('./electron_v8_extract.cjs');
 
 function parseArguments(argv) {
-  const result = { file: null, report: null, timeout: 1500, discover: false };
+  const result = {
+    file: null, report: null, traceFile: null, functionMatch: null,
+    timeout: 1500, closureDepth: MAX_TARGET_GRAPH_DEPTH, discover: false
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === '--discover') {
       result.discover = true;
       continue;
     }
-    if (argument === '--report' || argument === '--timeout') {
+    if (argument === '--report' || argument === '--trace-file' ||
+        argument === '--function-match' || argument === '--closure-depth' ||
+        argument === '--timeout') {
       if (++index >= argv.length) throw new Error(`missing value for ${argument}`);
       if (argument === '--report') result.report = argv[index];
+      else if (argument === '--trace-file') result.traceFile = argv[index];
+      else if (argument === '--function-match') result.functionMatch = argv[index];
+      else if (argument === '--closure-depth') result.closureDepth = Number(argv[index]);
       else result.timeout = Number(argv[index]);
       continue;
     }
     if (argument.startsWith('--') || result.file) throw new Error(`unexpected argument ${argument}`);
     result.file = argument;
   }
-  if (!result.file) throw new Error('usage: electron_v8_inspector_locals.cjs [--discover] [--report FILE] [--timeout MS] FILE.jsc');
+  if (!result.file) throw new Error('usage: electron_v8_inspector_locals.cjs [--discover] [--report FILE] [--trace-file FILE] [--function-match REGEXP] [--closure-depth 0-12] [--timeout MS] FILE.jsc');
   if (!Number.isInteger(result.timeout) || result.timeout < 1) throw new Error('timeout must be a positive integer');
+  if (!Number.isInteger(result.closureDepth) || result.closureDepth < 0 || result.closureDepth > MAX_TARGET_GRAPH_DEPTH) {
+    throw new Error(`closure depth must be an integer from 0 to ${MAX_TARGET_GRAPH_DEPTH}`);
+  }
   return result;
 }
 
@@ -79,26 +96,15 @@ function collectExportedCallables(value, label, seen, destination, depth = 0) {
   }
 }
 
-function materializeZeroArgumentExports(context, moduleRecord, timeout) {
-  const results = [];
+function materializeExportDiscoveries(context, moduleRecord, timeout, observations) {
   const candidates = [];
   collectExportedCallables(moduleRecord.exports, 'exports', new Set(), candidates);
-  for (const { name, value } of candidates) {
-    if (typeof value !== 'function' || value.length !== 0) continue;
-    if (Object.prototype.toString.call(value) === '[object AsyncFunction]') continue;
-    try {
-      context.__jsc2js_inspector_factory = value;
-      vm.runInContext(
-        '__jsc2js_inspector_factory_result = __jsc2js_inspector_factory();',
-        context,
-        { timeout, filename: `jsc2js-inspector-discover:${name}` }
-      );
-      results.push({ name, status: 'ok', value: context.__jsc2js_inspector_factory_result });
-    } catch (error) {
-      results.push({ name, status: 'error', error: String(error && error.message || error) });
-    }
-  }
-  return results;
+  return discoverReturnedFunctions(
+    context,
+    candidates.map(({ name, value }) => ({ label: name, fn: value })),
+    timeout,
+    observations
+  );
 }
 
 function createSession() {
@@ -151,12 +157,27 @@ async function remoteFunctionIdentity(session, remote) {
     );
     if (location && location.value && location.value.value) {
       const value = location.value.value;
-      return `${value.scriptId}:${value.lineNumber}:${value.columnNumber}`;
+      const source = `${value.scriptId}:${value.lineNumber}:${value.columnNumber}`;
+      const scopes = (properties.internalProperties || []).find(
+        property => property.name === '[[Scopes]]'
+      );
+      if (scopes && scopes.value && scopes.value.objectId) {
+        const scopeEntries = await remoteProperties(session, scopes.value, true);
+        const closure = scopeEntries.find(entry =>
+          /^\d+$/.test(entry.name || '') && entry.value && entry.value.objectId &&
+          String(entry.value.description || '').startsWith('Closure')
+        );
+        // A lexical context identity distinguishes closures from the same
+        // source position, while remaining stable when the same function is
+        // reached again through `prototype.constructor` or a captured alias.
+        if (closure) return `${source}:closure:${closure.value.objectId}`;
+      }
+      return source;
     }
   } catch {
     // Fall back to the object id below.
   }
-  return remote.objectId;
+  return remote && remote.objectId;
 }
 
 async function remoteProperties(session, remote, ownProperties = true) {
@@ -178,6 +199,7 @@ async function remoteProperties(session, remote, ownProperties = true) {
 const MAX_TARGET_GRAPH_DEPTH = 12;
 const MAX_TARGET_GRAPH_OBJECTS = 4096;
 const MAX_TARGET_GRAPH_PROPERTIES = 1024;
+const MAX_TARGET_FUNCTIONS = 512;
 
 function isIntrinsicFunctionProperty(name) {
   return name === 'arguments' || name === 'caller' ||
@@ -185,7 +207,7 @@ function isIntrinsicFunctionProperty(name) {
 }
 
 async function collectTargetValue(session, remote, label, state, targetScriptId, depth = 0) {
-  if (!remote || !remote.objectId || depth > MAX_TARGET_GRAPH_DEPTH) return;
+  if (!remote || !remote.objectId || depth > state.maxDepth) return;
   if (remote.type === 'function') {
     await collectTargetFunction(session, remote, label, state, targetScriptId, depth);
     return;
@@ -210,10 +232,14 @@ async function collectTargetOwnProperties(session, remote, label, state, targetS
 }
 
 async function collectTargetFunction(session, remote, label, state, targetScriptId, depth = 0) {
-  if (!remote || remote.type !== 'function' || !remote.objectId || depth > MAX_TARGET_GRAPH_DEPTH) return;
+  if (!remote || remote.type !== 'function' || !remote.objectId || depth > state.maxDepth) return;
   if (await remoteFunctionScriptId(session, remote) !== targetScriptId) return;
   const identity = await remoteFunctionIdentity(session, remote);
   if (state.seenFunctions.has(identity)) return;
+  if (state.functions.size >= MAX_TARGET_FUNCTIONS) {
+    state.functionGraphTruncated = true;
+    return;
+  }
   state.seenFunctions.add(identity);
   state.functions.set(identity, { remote, label, identity });
   await collectClosureScopeFunctions(session, remote, label, state, targetScriptId, depth + 1);
@@ -278,8 +304,9 @@ async function primitiveCall(session, objectId, declaration, args = []) {
   return Object.hasOwn(result, 'value') ? result.value : undefined;
 }
 
-async function dumpRemoteFunction(session, key, label, remote, report) {
-  console.log(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label })}`);
+async function dumpRemoteFunction(session, key, label, remote, report, trace) {
+  trace.write(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label })}`);
+  trace.flush();
   let constantPoolLength;
   try {
     constantPoolLength = await primitiveCall(
@@ -289,12 +316,12 @@ async function dumpRemoteFunction(session, key, label, remote, report) {
     );
   } catch (error) {
     report.functions.push({ key, label, status: 'get-bytecode-error', error: String(error.message || error) });
-    console.log(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`);
+    trace.write(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`);
     return;
   }
   if (constantPoolLength === -1 || constantPoolLength === undefined) {
     report.functions.push({ key, label, status: 'no-bytecode' });
-    console.log(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'no-bytecode' })}`);
+    trace.write(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'no-bytecode' })}`);
     return;
   }
   report.functions.push({
@@ -304,28 +331,37 @@ async function dumpRemoteFunction(session, key, label, remote, report) {
     identity: await remoteFunctionIdentity(session, remote),
     constantPoolLength
   });
-  console.log(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'ok' })}`);
-  console.log(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: constantPoolLength })}`);
+  trace.flush();
+  trace.write(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'ok' })}`);
+  trace.write(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: constantPoolLength })}`);
+  trace.flush();
   for (let index = 0; index < constantPoolLength; index += 1) {
-    console.log(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`);
+    trace.write(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`);
+    trace.flush();
     await callOn(
       session,
       remote.objectId,
       'function (index) { %DebugPrint(globalThis.__jsc2js_get_bytecode(this).constant_pool[index]); }',
       [{ value: index }]
     );
+    trace.flush();
   }
-  console.log(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
+  trace.write(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
 }
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
+  const functionMatcher = options.functionMatch ? new RegExp(options.functionMatch) : null;
   const absolute = path.resolve(options.file);
+  const trace = createTraceSink(options.traceFile);
   const report = {
     tool: 'electron_v8_inspector_locals',
     file: absolute,
     runtime: { electron: process.versions.electron, v8: process.versions.v8 },
     discover: options.discover,
+    traceFile: options.traceFile ? path.resolve(options.traceFile) : null,
+    functionMatch: options.functionMatch,
+    closureDepth: options.closureDepth,
     status: 'pending',
     functions: [],
     observations: {
@@ -370,27 +406,31 @@ async function main() {
       .map(entry => entry.callback)
       .filter(value => typeof value === 'function');
     if (options.discover && report.moduleInitialization === 'completed') {
-      const discoveries = materializeZeroArgumentExports(
-        context, initialized.moduleRecord, options.timeout
+      const discoveries = materializeExportDiscoveries(
+        context, initialized.moduleRecord, options.timeout, report.observations
       );
-      report.discovery = discoveries.map(({ name, status, error }) => ({ name, status, error }));
-      globalThis.__jsc2js_inspector_discovered = discoveries
-        .filter(item => item.status === 'ok')
-        .map(item => item.value);
+      report.discovery = discoveries.discovered;
+      // Preserve each recovered installer's origin in its Inspector property
+      // path. The dynamic closures themselves are real target-script functions
+      // and their [[Scopes]] reveal the private wrapper/decorator bodies that
+      // plain exported-function traversal cannot reach.
+      globalThis.__jsc2js_inspector_discovered = Object.fromEntries(
+        discoveries.functions.map((item, index) => [`${index}:${item.label}`, item.fn])
+      );
     }
     const exportsRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_exports');
     const callbacksRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_callbacks');
-    const state = { seenFunctions: new Set(), seenObjects: new Set(), functions: new Map() };
-    await collectTargetFunction(session, root, '$wrapper', state, rootScriptId);
-    await collectTargetExportFunctions(session, exportsRemote, 'exports', state, rootScriptId);
-    for (const callback of await remoteProperties(session, callbacksRemote, true)) {
-      if (!/^\d+$/.test(callback.name) || !callback.value) continue;
-      await collectTargetFunction(
-        session, callback.value, `callback.${callback.name}`, state, rootScriptId
-      );
-    }
-    if (options.discover && report.moduleInitialization === 'completed') {
-      const discoveredRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_discovered');
+    const discoveredRemote = options.discover && report.moduleInitialization === 'completed'
+      ? await evaluate(session, 'globalThis.__jsc2js_inspector_discovered')
+      : null;
+    const state = {
+      seenFunctions: new Set(), seenObjects: new Set(), functions: new Map(),
+      maxDepth: options.closureDepth
+    };
+    // Dynamic installer results are the reason for --discover. Traverse them
+    // first, before the module wrapper's broad lexical graph consumes the
+    // bounded closure budget.
+    if (discoveredRemote) {
       const discovered = await remoteProperties(session, discoveredRemote, true);
       for (const item of discovered) {
         if (!item.value) continue;
@@ -399,20 +439,30 @@ async function main() {
         );
       }
     }
+    await collectTargetFunction(session, root, '$wrapper', state, rootScriptId);
+    await collectTargetExportFunctions(session, exportsRemote, 'exports', state, rootScriptId);
+    for (const callback of await remoteProperties(session, callbacksRemote, true)) {
+      if (!/^\d+$/.test(callback.name) || !callback.value) continue;
+      await collectTargetFunction(
+        session, callback.value, `callback.${callback.name}`, state, rootScriptId
+      );
+    }
     const closures = [];
     for (const item of state.functions.values()) {
       if (item.remote.objectId === root.objectId) continue;
       if (await remoteFunctionScriptId(session, item.remote) === rootScriptId) closures.push(item);
     }
     report.closureCount = closures.length;
+    report.functionGraphTruncated = Boolean(state.functionGraphTruncated);
     report.targetScriptId = rootScriptId;
-    await dumpRemoteFunction(session, 'root', `${path.basename(absolute)}:$wrapper`, root, report);
+    await dumpRemoteFunction(session, 'root', `${path.basename(absolute)}:$wrapper`, root, report, trace);
     let ordinal = 0;
     for (const item of closures) {
+      if (functionMatcher && !functionMatcher.test(item.label)) continue;
       const closureKey = `closure-${ordinal++}`;
       await dumpRemoteFunction(
         session, closureKey,
-        `${path.basename(absolute)}:${item.label}`, item.remote, report
+        `${path.basename(absolute)}:${item.label}`, item.remote, report, trace
       );
     }
     report.status = 'accepted';
