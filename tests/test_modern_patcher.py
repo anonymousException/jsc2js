@@ -179,7 +179,7 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
             "static_cast<void>(expected_ro_snapshot_checksum);", patched
         )
 
-    def test_loader_uses_flat_direct_handle_worklist(self):
+    def test_loader_defaults_to_root_only_and_keeps_deep_walk_opt_in(self):
         loader = _loadjsc_definition()
         self.assertIn("base::OwnedVector<char> file_data", loader)
         self.assertIn("i::SerializedCodeData::kHeaderSize", loader)
@@ -200,6 +200,17 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
         self.assertIn("i::SerializedData::kMagicNumber", loader)
         self.assertIn("base::WriteLittleEndianValue(", loader)
         self.assertIn("i::MaybeDirectHandle<i::SharedFunctionInfo>", loader)
+        self.assertIn("void Shell::LoadJSCImpl", loader)
+        self.assertIn("bool traverse_nested", loader)
+        self.assertIn("if (!traverse_nested)", loader)
+        self.assertIn("print_function(function);", loader)
+        self.assertIn("LoadJSCImpl(args, false);", loader)
+        self.assertIn("void Shell::LoadJSCDeep", loader)
+        self.assertIn("LoadJSCImpl(args, true);", loader)
+        self.assertIn("(*current).ptr()", loader)
+        self.assertIn("[SharedFunctionInfo]", loader)
+        self.assertIn("[BytecodeArray]", loader)
+        self.assertNotIn("current->SharedFunctionInfoPrint", loader)
         self.assertIn(
             "i::DirectHandleVector<i::SharedFunctionInfo> pending(isolate)", loader
         )
@@ -207,6 +218,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
             "i::DirectHandleVector<i::SharedFunctionInfo> printed(isolate)", loader
         )
         self.assertIn("previous.is_identical_to(current)", loader)
+        root_copy = loader.index("printed.push_back(current);")
+        self.assertLess(root_copy, loader.index("pending.pop_back();", root_copy))
+        self.assertIn("if (seen) {\n        pending.pop_back();", loader)
         self.assertIn("pending.emplace_back", loader)
         self.assertIn("auto constants = bytecode->constant_pool();", loader)
         self.assertIn("constants->length().value()", loader)

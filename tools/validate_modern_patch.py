@@ -64,7 +64,30 @@ def validate_version(cache: RawSourceCache, version: str) -> dict:
             "exactly_five_files_changed": changed
             == sorted((D8_CC, D8_H, PRINTER_CC, STRING_CC, SERIALIZER_CC)),
             "loader_registered": (
-                PATCH_MARKER in d8 and 'global_template->Set(isolate, "loadjsc"' in d8
+                PATCH_MARKER in d8
+                and 'global_template->Set(isolate, "loadjsc"' in d8
+                and 'global_template->Set(isolate, "loadjscdeep"' in d8
+            ),
+            "root_only_loader_is_default": all(
+                token in d8
+                for token in (
+                    "void Shell::LoadJSCImpl",
+                    "bool traverse_nested",
+                    "if (!traverse_nested)",
+                    "LoadJSCImpl(args, false);",
+                    "LoadJSCImpl(args, true);",
+                )
+            ),
+            "deep_worklist_keeps_current_rooted": (
+                d8.index("printed.push_back(current);")
+                < d8.index(
+                    "pending.pop_back();", d8.index("printed.push_back(current);")
+                )
+            ),
+            "loader_uses_nonrecursive_sfi_summary": (
+                "(*current).ptr()" in d8
+                and "[SharedFunctionInfo]" in d8
+                and "current->SharedFunctionInfoPrint" not in d8
             ),
             "direct_handle_api_used": all(
                 token in d8
@@ -237,7 +260,8 @@ def main() -> int:
             "deserializer_protocol_checks_preserved": True,
             "heap_short_print_preserved": True,
             "missing_source_print_disabled": True,
-            "nested_functions_use_a_flat_deduplicated_worklist": True,
+            "root_function_is_the_default_safe_output": True,
+            "nested_functions_use_an_explicit_flat_deduplicated_worklist": True,
             "worklist_uses_v8_strong_root_allocator": True,
         },
         "versions": records,

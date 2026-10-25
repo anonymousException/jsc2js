@@ -314,7 +314,17 @@ def _loadjsc_definition(
     return f"""
 
 // {PATCH_MARKER}: crash-safe loader for source-less V8 code caches.
-void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
+//
+// Electron embeds a valid V8 cache but can lay out nested SharedFunctionInfo
+// references differently from upstream d8. The former default worklist walked
+// every bytecode constant pool after deserialization; on current Electron
+// caches that could hit a hardened std::vector bounds assertion before any
+// buffered output was emitted. Keep `loadjsc()` intentionally root-only. The
+// original recursive walker remains available as the explicit `loadjscdeep()`
+// diagnostic entry point, so it cannot make the safe/default analysis path
+// crash before it produces a useful root-function disassembly.
+void Shell::LoadJSCImpl(const FunctionCallbackInfo<Value>& args,
+                        bool traverse_nested) {{
   i::Isolate* isolate =
       reinterpret_cast<i::Isolate*>(args.GetIsolate());
   i::HandleScope handle_scope(isolate);
@@ -407,8 +417,50 @@ void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
       return;
     }}
 
+    auto print_function = [&](i::DirectHandle<i::SharedFunctionInfo> current) {{
+      if (!current->HasBytecodeArray()) return false;
+
+      i::Tagged<i::BytecodeArray> bytecode =
+          current->GetBytecodeArray(isolate);
+      std::cout << "\\nStart SharedFunctionInfo\\n";
+      // `SharedFunctionInfoPrint()` walks the whole object graph through
+      // `Brief()` and can recurse back into the same cached-data graph on
+      // current Electron V8. Emit the stable fields View8 needs without
+      // invoking the recursive object printer.
+      std::cout << "0x" << std::hex << (*current).ptr() << std::dec
+                << ": [SharedFunctionInfo]\\n";
+      std::cout << " - name: ";
+      if (current->HasSharedName()) {{
+        i::HeapObject::Print(current->Name(), std::cout);
+      }} else {{
+        std::cout << "<no-shared-name>";
+      }}
+      std::cout << "\\n - scope info: 0x" << std::hex
+                << current->scope_info().ptr() << std::dec;
+      if (current->HasOuterScopeInfo()) {{
+        std::cout << "\\n - outer scope info: 0x" << std::hex
+                  << current->GetOuterScopeInfo().ptr() << std::dec;
+      }}
+      std::cout << "\\n - bytecode_array: 0x" << std::hex
+                << bytecode.ptr() << std::dec << " [BytecodeArray]\\n";
+      std::cout << "\\nStart BytecodeArray\\n";
+      bytecode->Disassemble(std::cout);
+      std::cout << "\\nEnd BytecodeArray\\n";
+      std::cout << "End SharedFunctionInfo\\n" << std::flush;
+      return true;
+    }};
+
+    // Root-only is the default safe compatibility mode. It gives View8 a
+    // complete top-level function and does not inspect Electron-owned nested
+    // constant-pool references.
+    if (!traverse_nested) {{
+      print_function(function);
+      continue;
+    }}
+
     // A flat worklist avoids recursive HeapObjectShortPrint expansion and the
-    // stack-overflow cycle reported in issue #23.
+    // stack-overflow cycle reported in issue #23. This remains deliberately
+    // opt-in until every Electron cache family has been validated.
     // DirectHandle cannot safely live in a normal std::vector. V8's dedicated
     // container registers its backing storage as strong roots across GC.
     i::DirectHandleVector<i::SharedFunctionInfo> pending(isolate);
@@ -416,7 +468,6 @@ void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
     pending.push_back(function);
     while (!pending.empty()) {{
       i::DirectHandle<i::SharedFunctionInfo> current = pending.back();
-      pending.pop_back();
       bool seen = false;
       for (const auto& previous : printed) {{
         if (previous.is_identical_to(current)) {{
@@ -424,19 +475,19 @@ void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
           break;
         }}
       }}
-      if (seen) continue;
+      if (seen) {{
+        pending.pop_back();
+        continue;
+      }}
+      // `current` aliases a slot owned by `pending`. Retain a second strong
+      // root before removing that slot: printing/disassembling below may
+      // allocate and therefore trigger GC.
       printed.push_back(current);
-      if (!current->HasBytecodeArray()) continue;
+      pending.pop_back();
+      if (!print_function(current)) continue;
 
       i::Tagged<i::BytecodeArray> bytecode =
           current->GetBytecodeArray(isolate);
-      std::cout << "\\nStart SharedFunctionInfo\\n";
-      current->SharedFunctionInfoPrint(std::cout);
-      std::cout << "\\nStart BytecodeArray\\n";
-      bytecode->Disassemble(std::cout);
-      std::cout << "\\nEnd BytecodeArray\\n";
-      std::cout << "End SharedFunctionInfo\\n" << std::flush;
-
       auto constants = bytecode->constant_pool();
       const uint32_t constant_count = {constant_count};
       for (uint32_t index = 0; index < constant_count; ++index) {{
@@ -447,6 +498,14 @@ void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
       }}
     }}
   }}
+}}
+
+void Shell::LoadJSC(const FunctionCallbackInfo<Value>& args) {{
+  LoadJSCImpl(args, false);
+}}
+
+void Shell::LoadJSCDeep(const FunctionCallbackInfo<Value>& args) {{
+  LoadJSCImpl(args, true);
 }}
 """
 
@@ -490,12 +549,14 @@ def patch_d8_cc(text: str, features: ModernFeatures) -> str:
     registration = f"""  // {PATCH_MARKER}: public d8 entry point.
   global_template->Set(isolate, "loadjsc",
                        FunctionTemplate::New(isolate, LoadJSC));
+  global_template->Set(isolate, "loadjscdeep",
+                       FunctionTemplate::New(isolate, LoadJSCDeep));
 """
     return text[:return_anchor] + registration + text[return_anchor:]
 
 
 def patch_d8_h(text: str) -> str:
-    if "static void LoadJSC(" in text:
+    if "static void LoadJSCImpl(" in text:
         return text
     anchor = re.search(
         r"^(?P<indent>[ \t]*)static\s+base::OwnedVector\s*<\s*char\s*>\s+"
@@ -506,7 +567,11 @@ def patch_d8_h(text: str) -> str:
     if not anchor:
         raise PatchError("could not locate modern Shell::ReadChars declaration")
     declaration = (
+        f"{anchor.group('indent')}static void LoadJSCImpl("
+        "const FunctionCallbackInfo<Value>& args, bool traverse_nested);\n"
         f"{anchor.group('indent')}static void LoadJSC("
+        "const FunctionCallbackInfo<Value>& args);\n"
+        f"{anchor.group('indent')}static void LoadJSCDeep("
         "const FunctionCallbackInfo<Value>& args);\n"
     )
     return text[: anchor.start()] + declaration + text[anchor.start() :]
