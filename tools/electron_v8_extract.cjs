@@ -51,6 +51,12 @@ const INERT_VALUES = new WeakSet();
 // materialized closures without making the proxy emulate a real host.
 const INERT_CAPTURED_PROPERTIES = new WeakMap();
 const MAX_INERT_CAPTURED_PROPERTIES = 1024;
+const INERT_GLOBAL_NAMES = Object.freeze([
+  'wx', 'lib', 'game', 'ui', 'get', 'ai', '_status', 'vkcore',
+  'window', 'document', 'navigator', 'location', 'localStorage',
+  'indexedDB', 'Worker', 'WebSocket', 'fetch', 'Image', 'Audio',
+  'requestAnimationFrame', 'cancelAnimationFrame'
+]);
 
 function captureInertProperty(captured, property, value) {
   let values = captured.get(property);
@@ -219,6 +225,7 @@ function createInertValue(label, observations) {
   });
   INERT_VALUES.add(target);
   INERT_VALUES.add(proxy);
+  INERT_CAPTURED_PROPERTIES.set(target, captured);
   INERT_CAPTURED_PROPERTIES.set(proxy, captured);
   return proxy;
 }
@@ -401,12 +408,7 @@ function createSandbox(filename, observations, processType) {
     queueMicrotask() {},
     __jsc2js_callbacks: callbacks
   };
-  for (const name of [
-    'wx', 'lib', 'game', 'ui', 'get', 'ai', '_status', 'vkcore',
-    'window', 'document', 'navigator', 'location', 'localStorage',
-    'indexedDB', 'Worker', 'WebSocket', 'fetch', 'Image', 'Audio',
-    'requestAnimationFrame', 'cancelAnimationFrame'
-  ]) {
+  for (const name of INERT_GLOBAL_NAMES) {
     sandbox[name] = createInertValue(`global.${name}`, observations);
   }
   sandbox.global = sandbox;
@@ -453,7 +455,7 @@ function collectFunctions(value, label, seen, destination, depth = 0, state = { 
   const captured = (typeof value === 'object' || typeof value === 'function') &&
     value !== null ? INERT_CAPTURED_PROPERTIES.get(value) : null;
   if ((typeof value === 'object' || typeof value === 'function') &&
-      value !== null && INERT_VALUES.has(value) && !captured) return;
+      value !== null && INERT_VALUES.has(value) && (!captured || !captured.size)) return;
   if (seen.has(value) || depth > MAX_EXPORTED_GRAPH_DEPTH ||
       state.nodes >= MAX_EXPORTED_GRAPH_NODES || value === null || value === undefined) return;
   if (typeof value !== 'object' && typeof value !== 'function') return;
@@ -506,6 +508,19 @@ function collectFunctions(value, label, seen, destination, depth = 0, state = { 
     if (typeof descriptor.set === 'function') {
       collectFunctions(descriptor.set, `${childLabel}<set>`, seen, destination, depth + 1, state);
     }
+  }
+}
+
+function collectCapturedGlobalFunctions(context, destination) {
+  // Renderer bundles often expose their live namespace by assigning a single
+  // property such as `window.application = {...}`. The receiver is inert, so
+  // this does not mutate a real page; nevertheless its captured target
+  // closures are valid recovery roots and must not be lost merely because the
+  // module has no CommonJS exports.
+  const seen = new Set();
+  const state = { nodes: 0 };
+  for (const name of INERT_GLOBAL_NAMES) {
+    collectFunctions(context[name], `global.${name}`, seen, destination, 0, state);
   }
 }
 
@@ -656,16 +671,38 @@ function processFile(filename, options, ordinal, processType, trace) {
     dumpFunction(rootKey, `${path.basename(absolute)}:$wrapper`, wrapper, report, options.emit, trace);
     if (options.mode === 'root') return report;
 
-    const { moduleRecord, callbacks } = runModuleWrapper(
-      context, wrapper, absolute, options.timeout, report.observations
-    );
+    let initialized;
+    try {
+      initialized = runModuleWrapper(
+        context, wrapper, absolute, options.timeout, report.observations
+      );
+      report.moduleInitialization = 'completed';
+    } catch (error) {
+      // A renderer bundle can finish defining useful exports, callbacks, or
+      // closures before reaching a host-only API.  Keep the deserialized
+      // wrapper and all materialized roots instead of turning that partial
+      // recovery into a file-level failure.
+      initialized = {
+        moduleRecord: context.__jsc2js_module,
+        callbacks: context.__jsc2js_callbacks || []
+      };
+      report.moduleInitialization = 'interrupted';
+      report.moduleInitializationError = String(error && error.message || error);
+    }
+    const { moduleRecord, callbacks } = initialized;
     const functions = [];
-    collectFunctions(moduleRecord.exports, 'exports', new Set(), functions);
+    if (moduleRecord) collectFunctions(moduleRecord.exports, 'exports', new Set(), functions);
     callbacks.forEach((entry, index) => collectFunctions(entry.callback, `callback.${entry.kind}.${index}`, new Set(), functions));
-    if (options.mode === 'discover') {
+    collectCapturedGlobalFunctions(context, functions);
+    if (options.mode === 'discover' && report.moduleInitialization === 'completed') {
       const discovery = discoverReturnedFunctions(context, functions, options.timeout, report.observations);
       report.discovery = discovery.discovered;
       functions.push(...discovery.functions);
+    } else if (options.mode === 'discover') {
+      report.discovery = [{
+        status: 'skipped-module-initialization-interrupted',
+        error: report.moduleInitializationError
+      }];
     }
     const emitted = new Set([wrapper]);
     for (const entry of functions) {
@@ -730,7 +767,13 @@ module.exports = {
   // deserialize or execute a target cache by themselves.
   createInertValue,
   collectFunctions,
+  collectCapturedGlobalFunctions,
   discoverReturnedFunctions,
   createTraceSink,
-  parseArguments
+  parseArguments,
+  // Renderer extraction uses the renderer V8 snapshot for deserialization,
+  // then calls this same hermetic execution path with processType='renderer'.
+  // Keeping the sandbox implementation shared prevents browser/renderer
+  // analyses from silently gaining different host capabilities.
+  processFile
 };

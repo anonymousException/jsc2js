@@ -11,6 +11,7 @@ RENDER_MAIN = REPO_ROOT / "tools" / "electron_renderer_verify_main.cjs"
 RENDER_PRELOAD = REPO_ROOT / "tools" / "electron_renderer_verify_preload.cjs"
 RENDER_EXTRACT_MAIN = REPO_ROOT / "tools" / "electron_renderer_extract_main.cjs"
 RENDER_EXTRACT_PRELOAD = REPO_ROOT / "tools" / "electron_renderer_extract_preload.cjs"
+RENDER_INSPECTOR_PRELOAD = REPO_ROOT / "tools" / "electron_renderer_inspector_preload.cjs"
 INSPECTOR_LOCALS = REPO_ROOT / "tools" / "electron_v8_inspector_locals.cjs"
 
 
@@ -145,6 +146,75 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("new Uint8Array(info.bytecode)", preload)
         self.assertIn("script.runInThisContext()", preload)
         self.assertNotIn("wrapper(", preload)
+
+    def test_renderer_module_and_discover_use_the_shared_hermetic_sandbox(self):
+        # Renderer caches require a renderer V8 snapshot, but their CommonJS
+        # bodies must still run only with the same inert require/globals used
+        # by browser extraction. This is intentionally mode-driven: no game,
+        # filename, class, or method name participates in the decision.
+        preload = RENDER_EXTRACT_PRELOAD.read_text(encoding="utf-8")
+        main = RENDER_EXTRACT_MAIN.read_text(encoding="utf-8")
+        self.assertIn("MODULE_MODES", preload)
+        self.assertIn("processFile(filename, options", preload)
+        self.assertIn("'renderer'", preload)
+        self.assertIn("analysisContext", preload)
+        self.assertIn("hermetic-sandbox", preload)
+        self.assertIn("'root', 'module', 'discover', 'locals'", main)
+        self.assertIn("config.mode === 'locals'", main)
+        self.assertIn("hostTimeoutMs", main)
+        self.assertIn("config.hostTimeoutMs || 120000", main)
+
+    def test_renderer_locals_route_uses_cdp_not_node_inspector(self):
+        # Electron can create renderers without node:inspector support. The
+        # renderer route must therefore publish hermetic roots and let its
+        # browser coordinator traverse them through webContents.debugger.
+        preload = RENDER_INSPECTOR_PRELOAD.read_text(encoding="utf-8")
+        main = RENDER_EXTRACT_MAIN.read_text(encoding="utf-8")
+        self.assertIn("jsc2js-renderer-inspector-ready", preload)
+        self.assertIn("hermetic VM initialization", preload)
+        self.assertNotIn("require('node:inspector')", preload)
+        self.assertIn("inspectPreparedRendererRoots", main)
+        self.assertIn("Runtime.getProperties", main)
+        self.assertIn("Runtime.callFunctionOn", main)
+        self.assertIn("[[Scopes]]", main)
+        self.assertIn("hermetic-sandbox-with-cdp-scopes", main)
+        self.assertIn("bytecodeValues", main)
+        self.assertIn("constantPool", main)
+
+    def test_captured_renderer_global_assignments_are_recovery_roots(self):
+        # Large renderer bundles commonly publish a namespace by assigning to
+        # an inert global object rather than CommonJS module.exports. The
+        # generic proxy capture must retain those genuine target closures.
+        program = textwrap.dedent(
+            f"""
+            'use strict';
+            const vm = require('node:vm');
+            const extractor = require({json.dumps(str(EXTRACTOR))});
+            const observations = {{ stubCalls: [], stubWrites: [] }};
+            const context = vm.createContext({{}});
+            const receiver = extractor.createInertValue('global.window', observations);
+            function published() {{ return 7; }}
+            receiver.application = {{ published }};
+            context.window = receiver;
+            const functions = [];
+            extractor.collectCapturedGlobalFunctions(context, functions);
+            const labels = functions.map(entry => entry.label);
+            if (!labels.includes('global.window.application.published')) {{
+              throw new Error('missing published global closure: ' + labels.join(', '));
+            }}
+            if (!observations.stubWrites.includes('global.window.application')) {{
+              throw new Error('global assignment was not observed');
+            }}
+            """
+        )
+        completed = subprocess.run(
+            ["node", "--allow-natives-syntax", "-e", program],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr or completed.stdout)
 
     def test_inspector_local_enumerator_uses_only_the_isolated_extractor(self):
         source = INSPECTOR_LOCALS.read_text(encoding="utf-8")

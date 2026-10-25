@@ -25,6 +25,7 @@ const {
   createSandbox,
   runModuleWrapper,
   discoverReturnedFunctions,
+  collectCapturedGlobalFunctions,
   createTraceSink
 } = require('./electron_v8_extract.cjs');
 
@@ -349,13 +350,13 @@ async function dumpRemoteFunction(session, key, label, remote, report, trace) {
   trace.write(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
 }
 
-async function main() {
-  const options = parseArguments(process.argv.slice(2));
+async function extractLocals(options, environment = {}) {
+  const processType = environment.processType || 'browser';
+  const trace = environment.trace || createTraceSink(options.traceFile);
   const functionMatcher = options.functionMatch ? new RegExp(options.functionMatch) : null;
   const absolute = path.resolve(options.file);
-  const trace = createTraceSink(options.traceFile);
   const report = {
-    tool: 'electron_v8_inspector_locals',
+    tool: environment.tool || 'electron_v8_inspector_locals',
     file: absolute,
     runtime: { electron: process.versions.electron, v8: process.versions.v8 },
     discover: options.discover,
@@ -369,13 +370,14 @@ async function main() {
       stubCalls: [], stubWrites: [], console: [], exitCalls: []
     }
   };
+  if (environment.analysisContext) report.analysisContext = environment.analysisContext;
   const session = createSession();
   try {
     v8.setFlagsFromString('--no-lazy --no-flush-bytecode');
     await session.post('Debugger.enable');
     globalThis.__jsc2js_get_bytecode = function getBytecode(value) { return %GetBytecode(value); };
     globalThis.__jsc2js_print_value = function printValue(value) { %DebugPrint(value); };
-    const context = createSandbox(absolute, report.observations, 'browser');
+    const context = createSandbox(absolute, report.observations, processType);
     const { cachedData, source } = cacheForRuntime(absolute);
     const script = new vm.Script(source, { cachedData, filename: absolute });
     if (script.cachedDataRejected) throw new Error('cachedDataRejected by this Electron runtime');
@@ -405,6 +407,12 @@ async function main() {
     globalThis.__jsc2js_inspector_callbacks = (initialized.callbacks || [])
       .map(entry => entry.callback)
       .filter(value => typeof value === 'function');
+    const materializedGlobals = [];
+    collectCapturedGlobalFunctions(context, materializedGlobals);
+    report.materializedGlobalFunctionCount = materializedGlobals.length;
+    globalThis.__jsc2js_inspector_globals = Object.fromEntries(
+      materializedGlobals.map((item, index) => [`${index}:${item.label}`, item.fn])
+    );
     if (options.discover && report.moduleInitialization === 'completed') {
       const discoveries = materializeExportDiscoveries(
         context, initialized.moduleRecord, options.timeout, report.observations
@@ -420,6 +428,7 @@ async function main() {
     }
     const exportsRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_exports');
     const callbacksRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_callbacks');
+    const globalsRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_globals');
     const discoveredRemote = options.discover && report.moduleInitialization === 'completed'
       ? await evaluate(session, 'globalThis.__jsc2js_inspector_discovered')
       : null;
@@ -441,6 +450,7 @@ async function main() {
     }
     await collectTargetFunction(session, root, '$wrapper', state, rootScriptId);
     await collectTargetExportFunctions(session, exportsRemote, 'exports', state, rootScriptId);
+    await collectTargetExportFunctions(session, globalsRemote, 'global', state, rootScriptId);
     for (const callback of await remoteProperties(session, callbacksRemote, true)) {
       if (!/^\d+$/.test(callback.name) || !callback.value) continue;
       await collectTargetFunction(
@@ -476,14 +486,28 @@ async function main() {
     delete globalThis.__jsc2js_inspector_root;
     delete globalThis.__jsc2js_inspector_exports;
     delete globalThis.__jsc2js_inspector_callbacks;
+    delete globalThis.__jsc2js_inspector_globals;
     delete globalThis.__jsc2js_inspector_discovered;
   }
+  return report;
+}
+
+async function main() {
+  const options = parseArguments(process.argv.slice(2));
+  const report = await extractLocals(options);
   if (options.report) fs.writeFileSync(options.report, JSON.stringify(report, null, 2));
   console.error(`JSC2JS_INSPECTOR_LOCALS status=${report.status} closures=${report.closureCount || 0}`);
   if (report.status !== 'accepted') process.exitCode = 1;
 }
 
-main().catch(error => {
-  console.error(error.stack);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(error => {
+    console.error(error.stack);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  extractLocals,
+  parseArguments
+};

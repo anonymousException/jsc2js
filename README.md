@@ -72,6 +72,41 @@ python View8/view8.py --disassembled recovered.txt recovered.js
 在 Windows GUI Electron 中，`--trace-file` 会把 V8 的原生字节码输出及标记写入同一文件。
 该选项需要宿主能加载 Koffi；可用 `JSC2JS_KOFFI_PATH` 指定 Koffi 的安装目录。
 
+### Renderer / Isolated World 提取
+
+主进程与 renderer 的 V8 快照不同。同名类或模块在两个上下文中不是同一个运行时对象，
+因此 renderer `.jsc` 必须在 renderer 快照中反序列化。使用一个独立 Electron 分析宿主，
+并通过 `JSC2JS_RENDER_CONFIG` 传入 JSON 配置：
+
+```json
+{
+  "files": ["C:\\target\\renderer-entry.jsc"],
+  "report": "C:\\out\\renderer.json",
+  "mode": "locals",
+  "emit": "none",
+  "timeoutMs": 30000,
+  "closureDepth": 2
+}
+```
+
+设置 `JSC2JS_RENDER_MODE=extract` 后启动该宿主。`root` 只导出包装器；`module` 在惰性
+VM 中初始化 CommonJS 包装器；`discover` 还以惰性参数调用同步导出工厂/安装器；`locals`
+使用 Electron DevTools Protocol 遍历同一隔离 VM 中的 `[[Scopes]]`，适合没有 CommonJS
+导出、只把命名空间挂到 `window` / `globalThis` 的大型 bundle。报告会显式记录
+`cacheSnapshot: "renderer"`、`executionContext` 与 `wrapperExecution`，以避免把 browser
+和 renderer 的对象混为同一实例。
+
+`locals` 的 JSON 结果还为每个已恢复函数提供 `bytecodeValues` 与轻量的
+`constantPool` 摘要；这在 renderer 不把 V8 原生调试输出接到控制台时，仍可保存与
+后续处理原始字节码。启用 `traceFile` 时，工具的标记会写入 renderer 的 CRT 输出流，
+避免与可能存在的原生 V8 打印竞争文件偏移。
+
+所有非 `root` 模式均复用主提取器的只读文件系统、惰性 `require`、惰性全局对象、无调度
+计时器和无真实 Electron bridge；不会加载目标页面、调用产品 API 或写入目标目录。`
+moduleInitialization: "interrupted"` 表示已保留初始化前完成物化的根，但自动工厂发现会被跳过。
+`timeoutMs` 限制单个包装器/闭包操作；若需要调整整个隐藏 renderer 的总等待时间，使用独立的
+`hostTimeoutMs`（默认 120000），不要把两者混用。
+
 ---
 
 ## 说明
@@ -199,6 +234,49 @@ those arguments, including chained forms such as `Engine.prototype`. `verify`,
 On Windows GUI Electron hosts, `--trace-file` writes both V8's native bytecode
 output and the extraction markers to one file. The host must be able to load
 Koffi; set `JSC2JS_KOFFI_PATH` to a Koffi installation directory if needed.
+
+### Renderer / isolated-world extraction
+
+Browser and renderer V8 snapshots differ. A class or module with the same name
+in both contexts is not the same runtime object, so renderer `.jsc` must be
+deserialized in a renderer snapshot. Start a separate Electron analysis host
+with `JSC2JS_RENDER_MODE=extract` and point `JSC2JS_RENDER_CONFIG` at a JSON
+configuration such as:
+
+```json
+{
+  "files": ["C:\\target\\renderer-entry.jsc"],
+  "report": "C:\\out\\renderer.json",
+  "mode": "locals",
+  "emit": "none",
+  "timeoutMs": 30000,
+  "closureDepth": 2
+}
+```
+
+`root` exports only the wrapper. `module` initializes the CommonJS wrapper in
+an inert VM, and `discover` additionally invokes synchronous exported
+factories/installers with inert arguments. `locals` uses the Electron DevTools
+Protocol to walk `[[Scopes]]` in that same isolated VM; use it for large
+bundles with no CommonJS exports that publish a namespace onto `window` or
+`globalThis`. Reports explicitly include `cacheSnapshot: "renderer"`,
+`executionContext`, and `wrapperExecution` so browser and renderer objects are
+not conflated.
+
+`locals` JSON additionally carries `bytecodeValues` and a lightweight
+`constantPool` summary for every recovered function. That preserves raw
+bytecode for later processing even when a renderer does not route V8 native
+debug output to its console. With `traceFile`, tool markers use the renderer
+CRT output stream, avoiding file-offset contention with any native V8 prints.
+
+Every non-`root` mode reuses the main extractor's read-only filesystem, inert
+`require`, inert globals, non-scheduling timers, and no real Electron bridge.
+It never loads the target page, calls product APIs, or writes into the target
+directory. `moduleInitialization: "interrupted"` preserves roots materialized
+before a host-only initializer failed, while skipping automatic factory
+discovery. `timeoutMs` bounds one wrapper/closure operation. Use the separate
+`hostTimeoutMs` (default 120000) only when the overall hidden-renderer wait
+needs adjustment.
 
 ---
 

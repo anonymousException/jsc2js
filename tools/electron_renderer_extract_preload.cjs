@@ -1,24 +1,44 @@
 'use strict';
 
-// Renderer-side root-function extractor.  Run through
-// electron_renderer_extract_main.cjs with --allow-natives-syntax and
-// --print-bytecode.  Only script.runInThisContext() is used to materialize a
-// CommonJS wrapper; the wrapper itself is never invoked.
+// Renderer-snapshot extractor. A Bytenode cache is deserialized only in this
+// renderer, whose V8 snapshot matches renderer-generated JSC. `module` and
+// `discover` then run the CommonJS wrapper in the same hermetic VM sandbox used
+// by electron_v8_extract.cjs; they never receive the real renderer globals,
+// Node process, Electron bridge, or writable filesystem.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const v8 = require('node:v8');
 const { brotliDecompressSync } = require('node:zlib');
 const { ipcRenderer } = require('electron');
+const {
+  createTraceSink,
+  processFile
+} = require('./electron_v8_extract.cjs');
 
 const configPath = process.env.JSC2JS_RENDER_CONFIG;
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const magic = Buffer.from([0xde, 0xc0]);
 const zeroExternalReferenceTable = Buffer.alloc(2);
+const MODULE_MODES = new Set(['module', 'discover']);
+const ROOT_MODE = 'root';
 
-function emit(line) {
-  // Renderer stdout is inherited by the isolated analysis host.  The adapter
-  // consumes only these explicit markers and ignores Electron bootstrap logs.
-  process.stdout.write(`${line}\n`);
+function extractionOptions() {
+  const mode = config.mode || ROOT_MODE;
+  const emit = config.emit || (config.traceFile ? 'trace' : 'none');
+  const timeout = Number(config.timeoutMs || config.timeout || 1500);
+  if (![ROOT_MODE, ...MODULE_MODES].includes(mode)) {
+    throw new Error(`unsupported renderer extraction mode ${JSON.stringify(mode)}`);
+  }
+  if (!['trace', 'none'].includes(emit)) {
+    throw new Error(`unsupported renderer emit mode ${JSON.stringify(emit)}`);
+  }
+  if (emit === 'trace' && !config.traceFile) {
+    throw new Error('renderer trace mode requires config.traceFile');
+  }
+  if (!Number.isInteger(timeout) || timeout < 1) {
+    throw new Error('renderer timeout must be a positive integer');
+  }
+  return { mode, emit, timeout };
 }
 
 function isV8Cache(buffer) {
@@ -27,7 +47,7 @@ function isV8Cache(buffer) {
     buffer.subarray(2, 4).equals(magic);
 }
 
-function loadWrapper(filename) {
+function loadRootWrapper(filename) {
   let cache = Buffer.from(fs.readFileSync(filename));
   if (!isV8Cache(cache)) cache = brotliDecompressSync(cache);
   if (!isV8Cache(cache)) throw new Error('not a V8/Bytenode cache');
@@ -45,37 +65,38 @@ function loadWrapper(filename) {
   return wrapper;
 }
 
-function dumpRoot(key, filename, wrapper) {
-  emit(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label: `${filename}:$wrapper` })}`);
+function emit(line, trace) {
+  trace.write(`${line}\n`);
+  trace.flush();
+}
+
+function dumpRoot(key, filename, wrapper, trace) {
+  emit(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label: `${filename}:$wrapper` })}`, trace);
   let info;
   try {
     info = %GetBytecode(wrapper);
   } catch (error) {
-    emit(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`);
+    emit(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`, trace);
     return { key, status: 'get-bytecode-error', error: String(error && error.message || error) };
   }
-  emit(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: info === undefined ? 'no-bytecode' : 'ok' })}`);
+  emit(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: info === undefined ? 'no-bytecode' : 'ok' })}`, trace);
   if (info === undefined) return { key, status: 'no-bytecode' };
-  emit(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: info.constant_pool.length })}`);
+  emit(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: info.constant_pool.length })}`, trace);
   for (let index = 0; index < info.constant_pool.length; index += 1) {
-    emit(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`);
+    emit(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`, trace);
     %DebugPrint(info.constant_pool[index]);
+    trace.flush();
   }
-  emit(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
+  emit(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`, trace);
   let bytecodeValues = null;
   try {
     bytecodeValues = Array.from(new Uint8Array(info.bytecode));
   } catch {
-    // Some V8 builds expose the BytecodeArray as a non-iterable internal
-    // wrapper.  The metadata remains useful even in that case.
+    // Some V8 builds expose the BytecodeArray only as an internal wrapper.
   }
   return {
     key, status: 'ok', parameterCount: info.parameter_count,
     frameSize: info.frame_size, constantPoolLength: info.constant_pool.length,
-    // Kept in the JSON report because renderer stdout is not generally wired
-    // to the browser process by Electron.  This tells callers whether a given
-    // Electron build exposes a JS-readable instruction payload in addition to
-    // its standard bytecode metadata.
     bytecodeInfoKeys: Reflect.ownKeys(info).map(String),
     bytecodeType: Object.prototype.toString.call(info.bytecode),
     bytecodeLength: Number(info.bytecode && info.bytecode.byteLength) || 0,
@@ -83,23 +104,58 @@ function dumpRoot(key, filename, wrapper) {
   };
 }
 
-function extract(filename, ordinal) {
+function rendererContext(wrapperExecution) {
+  return Object.freeze({
+    runtimeProcessType: process.type,
+    cacheSnapshot: 'renderer',
+    executionContext: 'isolated-analysis-vm',
+    wrapperExecution
+  });
+}
+
+function extractRoot(filename, ordinal, trace) {
   try {
-    const wrapper = loadWrapper(filename);
+    const wrapper = loadRootWrapper(filename);
     return {
       file: filename, status: 'accepted', wrapperArity: wrapper.length,
-      functions: [dumpRoot(`${ordinal}-root`, filename.split(/[\\/]/).pop(), wrapper)]
+      analysisContext: rendererContext('not-invoked'),
+      functions: [dumpRoot(`${ordinal}-root`, filename.split(/[\\/]/).pop(), wrapper, trace)]
     };
   } catch (error) {
     return { file: filename, status: 'error', error: String(error && error.stack || error), functions: [] };
   }
 }
 
+function extractModule(filename, ordinal, options, trace) {
+  const result = processFile(filename, options, ordinal + 1, 'renderer', trace);
+  result.analysisContext = rendererContext('hermetic-sandbox');
+  return result;
+}
+
 v8.setFlagsFromString('--no-lazy --no-flush-bytecode');
-const results = config.files.map(extract);
+let options;
+let results;
+try {
+  options = extractionOptions();
+  const trace = options.emit === 'trace'
+    ? createTraceSink(config.traceFile)
+    : Object.freeze({ write() {}, flush() {} });
+  results = config.files.map((file, index) => options.mode === ROOT_MODE
+    ? extractRoot(file, index, trace)
+    : extractModule(file, index, options, trace));
+} catch (error) {
+  options = options || { mode: config.mode || ROOT_MODE, emit: config.emit || 'none' };
+  results = config.files.map(file => ({
+    file, status: 'error', error: String(error && error.stack || error), functions: []
+  }));
+}
 const failed = results.filter(result => result.status !== 'accepted').length;
 ipcRenderer.send('jsc2js-renderer-extract-result', {
   tool: 'electron_renderer_extract',
   runtime: { electron: process.versions.electron, v8: process.versions.v8, type: process.type },
+  mode: options.mode,
+  emit: options.emit,
+  traceFile: config.traceFile || null,
+  analysisContext: rendererContext(options.mode === ROOT_MODE ? 'not-invoked' : 'hermetic-sandbox'),
   accepted: results.length - failed, failed, results
 });
