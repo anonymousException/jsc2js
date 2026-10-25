@@ -1,4 +1,7 @@
 import unittest
+import json
+import subprocess
+import textwrap
 from pathlib import Path
 
 
@@ -34,6 +37,10 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         # extractor must walk descriptors rather than only enumerable exports.
         self.assertIn("Reflect.ownKeys", source)
         self.assertIn("MAX_EXPORTED_GRAPH_DEPTH", source)
+        self.assertIn("--trace-file FILE", source)
+        self.assertIn("createTraceSink", source)
+        self.assertIn("fputs", source)
+        self.assertIn("freopen", source)
 
     def test_export_graph_recovers_non_enumerable_class_and_accessor_logic(self):
         source = EXTRACTOR.read_text(encoding="utf-8")
@@ -49,6 +56,54 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("descriptor.set", collector)
         self.assertIn("key === 'arguments'", collector)
         self.assertNotIn("Object.keys(value)", collector)
+
+    def test_discover_recovers_installer_methods_written_to_inert_arguments(self):
+        # A common plugin pattern is `install(Engine)`, followed by writes to
+        # `Engine.prototype`. The installer returns nothing, so ordinary return
+        # value discovery cannot reach its closures. Exercise the generic inert
+        # argument capture path with both assignment and defineProperty.
+        program = textwrap.dedent(
+            f"""
+            'use strict';
+            const vm = require('node:vm');
+            const extractor = require({json.dumps(str(EXTRACTOR))});
+            const observations = {{ stubCalls: [], stubWrites: [] }};
+            const context = vm.createContext({{}});
+            function install(Type) {{
+              Type.prototype.directInstalled = function directInstalled() {{ return 1; }};
+              Object.defineProperty(Type.prototype, 'descriptorInstalled', {{
+                value: function descriptorInstalled() {{ return 2; }}
+              }});
+            }}
+            const result = extractor.discoverReturnedFunctions(
+              context,
+              [{{ label: 'exports.install', fn: install }}],
+              1000,
+              observations
+            );
+            const labels = result.functions.map(entry => entry.label).sort();
+            if (!labels.includes('exports.install(argument0).directInstalled')) {{
+              throw new Error('missing assignment-installed closure: ' + labels.join(', '));
+            }}
+            if (!labels.includes('exports.install(argument0).descriptorInstalled')) {{
+              throw new Error('missing descriptor-installed closure: ' + labels.join(', '));
+            }}
+            if (!observations.stubWrites.some(item => item.endsWith('.directInstalled'))) {{
+              throw new Error('assignment write was not observed');
+            }}
+            if (!observations.stubWrites.some(item => item.endsWith('.descriptorInstalled<defineProperty>'))) {{
+              throw new Error('descriptor write was not observed');
+            }}
+            """
+        )
+        completed = subprocess.run(
+            ["node", "--allow-natives-syntax", "-e", program],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr or completed.stdout)
 
     def test_electron_app_stub_is_extensible_without_executing_host_methods(self):
         source = EXTRACTOR.read_text(encoding="utf-8")

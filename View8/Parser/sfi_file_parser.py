@@ -1,5 +1,4 @@
 from Parser.shared_function_info import SharedFunctionInfo, CodeLine
-from parse import parse
 import re
 import traceback
 from typing import List, Optional, Tuple, Dict, Set
@@ -520,7 +519,13 @@ def parse_const_pool(line: str, lines, func_name: str) -> List[str]:
 # --------------------------
 
 def parse_exception_table_line(line: str) -> Tuple[int, List[int]]:
-    from_, to_, key, _ = parse("({},{})  -> {} ({}", line)
+    match = re.search(
+        r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*->\s*(-?\d+)\s*\(",
+        line,
+    )
+    if not match:
+        raise ValueError(f"Invalid handler-table line: {line}")
+    from_, to_, key = match.groups()
     return int(key), [int(from_), int(to_)]
 
 
@@ -542,23 +547,23 @@ def parse_handler_table(line: str, lines) -> Dict[int, List[int]]:
 
 
 def parse_parameter_count(line: str) -> int:
-    return int(parse("Parameter count {}", line)[0])
+    match = re.fullmatch(r"Parameter count\s+(-?\d+)", line.strip())
+    if not match:
+        raise ValueError(f"Invalid parameter count: {line}")
+    return int(match.group(1))
 
 
 def parse_register_count(line: str) -> int:
-    return int(parse("Register count {}", line)[0])
+    match = re.fullmatch(r"Register count\s+(-?\d+)", line.strip())
+    if not match:
+        raise ValueError(f"Invalid register count: {line}")
+    return int(match.group(1))
 
 
 def parse_address(line: str) -> str:
-    # Try the full format first
-    res = parse("{}: [{}] in {}", line)
-    if res:
-        return res[0]
-    # Fallback to shorter format without "in {}"
-    res = parse("{}: [{}]", line)
-    if res:
-        return res[0]
-    # If neither matches, raise an error for debugging
+    match = re.match(r"^\s*([^:]+):\s*\[[^\]]+\](?:\s+in\s+.+)?\s*$", line)
+    if match:
+        return match.group(1).strip()
     raise ValueError(f"Invalid address line format: {line}")
 
 

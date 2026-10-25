@@ -50,12 +50,27 @@ python view8.py --disassembled ../xxx.txt ../xxx.js
 
 ### 4. 依赖环境
 
-View8 需要：
-- Python 3.9+（建议）
-- 依赖
-  ```bash
-  pip install -r requirements.txt
-  ```
+View8 需要 Python 3.9+（建议）；当前解析器只使用标准库，无额外 Python 包依赖。
+
+### Electron / Bytenode 运行时提取
+
+对于由 Electron 生成、或模块初始化后会动态安装方法的 `.jsc`，使用目标
+Electron 可执行文件运行 `tools/electron_v8_extract.cjs`：
+
+```bash
+ELECTRON_RUN_AS_NODE=1 <electron.exe> --allow-natives-syntax --print-bytecode \
+  tools/electron_v8_extract.cjs --mode discover --trace-file recovered.trace.txt \
+  --report recovered.json target.jsc
+python tools/electron_v8_to_view8.py --trace recovered.trace.txt --output recovered.txt
+python View8/view8.py --disassembled recovered.txt recovered.js
+```
+
+`discover` 只在隔离 VM 中、以惰性参数调用导出的同步工厂/安装器；除返回值闭包外，
+它还会恢复安装器对这些参数（包括 `Engine.prototype` 形式的链式访问）直接赋值或
+`Object.defineProperty` 新增的方法。`verify`、`root`、`module` 模式不会调用导出函数。
+
+在 Windows GUI Electron 中，`--trace-file` 会把 V8 的原生字节码输出及标记写入同一文件。
+该选项需要宿主能加载 Koffi；可用 `JSC2JS_KOFFI_PATH` 指定 Koffi 的安装目录。
 
 ---
 
@@ -158,12 +173,32 @@ Result:
 
 ### 4. Requirements
 
-View8 requires:
-- Python 3.9+ (recommended)
-- Dependencies:
-  ```bash
-  pip install -r requirements.txt
-  ```
+View8 requires Python 3.9+ (recommended). Its current parser uses only the
+standard library and has no additional Python package dependency.
+
+### Electron / Bytenode runtime extraction
+
+For Electron-generated `.jsc` files, including modules that install methods
+dynamically during initialization, run `tools/electron_v8_extract.cjs` with the
+target Electron executable:
+
+```bash
+ELECTRON_RUN_AS_NODE=1 <electron.exe> --allow-natives-syntax --print-bytecode \
+  tools/electron_v8_extract.cjs --mode discover --trace-file recovered.trace.txt \
+  --report recovered.json target.jsc
+python tools/electron_v8_to_view8.py --trace recovered.trace.txt --output recovered.txt
+python View8/view8.py --disassembled recovered.txt recovered.js
+```
+
+`discover` invokes synchronous exported factories/installers only in the
+isolated VM with inert arguments. In addition to returned closures, it recovers
+methods installed through direct assignment or `Object.defineProperty` on
+those arguments, including chained forms such as `Engine.prototype`. `verify`,
+`root`, and `module` never invoke exported functions.
+
+On Windows GUI Electron hosts, `--trace-file` writes both V8's native bytecode
+output and the extraction markers to one file. The host must be able to load
+Koffi; set `JSC2JS_KOFFI_PATH` to a Koffi installation directory if needed.
 
 ---
 

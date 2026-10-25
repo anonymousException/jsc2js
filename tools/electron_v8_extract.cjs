@@ -26,8 +26,11 @@
  *
  * `%GetBytecode` / `%DebugPrint` require --allow-natives-syntax; bytecode text
  * requires --print-bytecode.  Capture both process streams, then pass the
- * marker-bearing transcript to electron_v8_to_view8.py --trace.  The adapter
- * ignores runtime bootstrap bytecode outside its explicit markers.
+ * marker-bearing transcript to electron_v8_to_view8.py --trace.  On Windows
+ * GUI Electron builds, --trace-file redirects V8's native stdout to a file
+ * through an optional host-side Koffi binding, so a console handle is not
+ * required.  The adapter ignores runtime bootstrap bytecode outside its
+ * explicit markers.
  */
 
 const fs = require('node:fs');
@@ -42,23 +45,44 @@ const ZERO_EXTERNAL_REFERENCE_TABLE = Buffer.alloc(2);
 // a real JSFunction/SFI and V8's debug intrinsic is intentionally not a proxy
 // inspection API.
 const INERT_VALUES = new WeakSet();
+// `discover` intentionally calls exports with inert arguments. Installers
+// commonly add methods to an argument's prototype rather than returning them;
+// retain those writes so the bounded function graph can recover the newly
+// materialized closures without making the proxy emulate a real host.
+const INERT_CAPTURED_PROPERTIES = new WeakMap();
+const MAX_INERT_CAPTURED_PROPERTIES = 1024;
+
+function captureInertProperty(captured, property, value) {
+  let values = captured.get(property);
+  if (!values) {
+    if (captured.size >= MAX_INERT_CAPTURED_PROPERTIES) return;
+    values = new Set();
+    captured.set(property, values);
+  }
+  values.add(value);
+}
 
 function usage(message) {
   if (message) console.error(`error: ${message}`);
-  console.error('usage: electron_v8_extract.cjs [--mode verify|root|module|discover] [--emit trace|none] [--report FILE] [--timeout MS] FILE.jsc ...');
+  console.error('usage: electron_v8_extract.cjs [--mode verify|root|module|discover] [--emit trace|none] [--trace-file FILE] [--report FILE] [--timeout MS] FILE.jsc ...');
   process.exitCode = 2;
 }
 
 function parseArguments(argv) {
-  const result = { mode: 'verify', emit: 'trace', report: null, timeout: 1500, files: [] };
+  const result = {
+    mode: 'verify', emit: 'trace', report: null, traceFile: null,
+    timeout: 1500, files: []
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === '--mode' || argument === '--emit' || argument === '--report' || argument === '--timeout') {
+    if (argument === '--mode' || argument === '--emit' || argument === '--report' ||
+        argument === '--trace-file' || argument === '--timeout') {
       if (++index >= argv.length) throw new Error(`missing value for ${argument}`);
       const value = argv[index];
       if (argument === '--mode') result.mode = value;
       if (argument === '--emit') result.emit = value;
       if (argument === '--report') result.report = value;
+      if (argument === '--trace-file') result.traceFile = value;
       if (argument === '--timeout') result.timeout = Number(value);
       continue;
     }
@@ -67,9 +91,67 @@ function parseArguments(argv) {
   }
   if (!['verify', 'root', 'module', 'discover'].includes(result.mode)) throw new Error(`unsupported mode ${result.mode}`);
   if (!['trace', 'none'].includes(result.emit)) throw new Error(`unsupported emit mode ${result.emit}`);
+  if (result.traceFile && result.emit !== 'trace') throw new Error('--trace-file requires --emit trace');
   if (!Number.isInteger(result.timeout) || result.timeout < 1) throw new Error('timeout must be a positive integer');
   if (!result.files.length) throw new Error('at least one .jsc file is required');
   return result;
+}
+
+function loadHostKoffi() {
+  const candidates = [];
+  if (process.env.JSC2JS_KOFFI_PATH) candidates.push(process.env.JSC2JS_KOFFI_PATH);
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'app', 'node_modules', 'koffi'));
+  }
+  candidates.push('koffi');
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      return require(candidate);
+    } catch (error) {
+      errors.push(`${candidate}: ${String(error && error.message || error)}`);
+    }
+  }
+  throw new Error(
+    'Windows --trace-file requires Koffi in the host runtime. Set JSC2JS_KOFFI_PATH ' +
+    `or bundle koffi with the Electron app. Attempts: ${errors.join(' | ')}`
+  );
+}
+
+function createTraceSink(traceFile) {
+  if (!traceFile) {
+    return Object.freeze({ write(line) { console.log(line); }, flush() {} });
+  }
+  if (process.platform !== 'win32') {
+    throw new Error('--trace-file is for Windows GUI Electron hosts; redirect stdout on this platform');
+  }
+  const absolute = path.resolve(traceFile);
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
+  fs.writeFileSync(absolute, '');
+  const koffi = loadHostKoffi();
+  const crt = koffi.load('ucrtbase.dll');
+  const iob = crt.func('void * __cdecl __acrt_iob_func(int index)');
+  const reopen = crt.func('void * __cdecl freopen(const char *filename, const char *mode, void *stream)');
+  const fputs = crt.func('int __cdecl fputs(const char *text, void *stream)');
+  const fflush = crt.func('int __cdecl fflush(void *stream)');
+  const stdout = iob(1);
+  if (!reopen(absolute, 'ab', stdout)) {
+    throw new Error(`failed to redirect native stdout to trace file: ${absolute}`);
+  }
+  // `%GetBytecode` and `%DebugPrint` write through the CRT stdout stream.
+  // Emit marker records through that identical FILE* as well. Mixing
+  // fs.appendFileSync with freopen creates competing file offsets and can
+  // overwrite records on GUI Electron hosts.
+  const write = line => {
+    if (fputs(`${line}\n`, stdout) < 0) {
+      throw new Error(`failed to write trace marker to: ${absolute}`);
+    }
+  };
+  const flush = () => { fflush(stdout); };
+  return Object.freeze({
+    write,
+    flush
+  });
 }
 
 function isV8Cache(buffer) {
@@ -98,6 +180,7 @@ function cacheForRuntime(filename) {
 
 function createInertValue(label, observations) {
   let proxy;
+  const captured = new Map();
   const target = function inertTarget() { return proxy; };
   proxy = new Proxy(target, {
     get(_target, property) {
@@ -106,10 +189,19 @@ function createInertValue(label, observations) {
       if (property === Symbol.toPrimitive) return () => 0;
       if (property === Symbol.toStringTag) return 'JSC2JSInert';
       if (property === 'toString') return () => `[JSC2JS inert ${label}]`;
+      if (captured.has(property)) return captured.get(property).values().next().value;
       return proxy;
     },
-    set(_target, property) {
+    set(_target, property, value) {
       observations.stubWrites.push(`${label}.${String(property)}`);
+      captureInertProperty(captured, property, value);
+      return true;
+    },
+    defineProperty(_target, property, descriptor) {
+      observations.stubWrites.push(`${label}.${String(property)}<defineProperty>`);
+      if (Object.hasOwn(descriptor, 'value')) captureInertProperty(captured, property, descriptor.value);
+      if (typeof descriptor.get === 'function') captureInertProperty(captured, property, descriptor.get);
+      if (typeof descriptor.set === 'function') captureInertProperty(captured, property, descriptor.set);
       return true;
     },
     apply() {
@@ -127,6 +219,7 @@ function createInertValue(label, observations) {
   });
   INERT_VALUES.add(target);
   INERT_VALUES.add(proxy);
+  INERT_CAPTURED_PROPERTIES.set(proxy, captured);
   return proxy;
 }
 
@@ -357,14 +450,29 @@ const MAX_EXPORTED_GRAPH_NODES = 4096;
 const MAX_EXPORTED_GRAPH_PROPERTIES = 1024;
 
 function collectFunctions(value, label, seen, destination, depth = 0, state = { nodes: 0 }) {
+  const captured = (typeof value === 'object' || typeof value === 'function') &&
+    value !== null ? INERT_CAPTURED_PROPERTIES.get(value) : null;
   if ((typeof value === 'object' || typeof value === 'function') &&
-      value !== null && INERT_VALUES.has(value)) return;
+      value !== null && INERT_VALUES.has(value) && !captured) return;
   if (seen.has(value) || depth > MAX_EXPORTED_GRAPH_DEPTH ||
       state.nodes >= MAX_EXPORTED_GRAPH_NODES || value === null || value === undefined) return;
   if (typeof value !== 'object' && typeof value !== 'function') return;
   seen.add(value);
   state.nodes += 1;
-  if (typeof value === 'function') destination.push({ label, fn: value });
+  if (typeof value === 'function' && !captured) destination.push({ label, fn: value });
+
+  // An inert argument is normally opaque. In discover mode, however, a
+  // factory/installer can attach genuine target closures to it. Traverse only
+  // the bounded writes we observed instead of reflecting on the Proxy target.
+  if (captured) {
+    for (const [key, children] of captured) {
+      const property = typeof key === 'symbol' ? key.toString() : String(key);
+      for (const child of children) {
+        collectFunctions(child, `${label}.${property}`, seen, destination, depth + 1, state);
+      }
+    }
+    return;
+  }
 
   // Do not stop at a function object.  Exported ES classes keep their actual
   // logic in non-enumerable `prototype` methods, and accessors keep it in
@@ -405,17 +513,27 @@ function safeKey(text) {
   return text.replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 120) || 'anonymous';
 }
 
-function dumpFunction(key, label, fn, report, emit) {
+function dumpFunction(key, label, fn, report, emit, trace) {
   let info;
-  if (emit === 'trace') console.log(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label })}`);
+  if (emit === 'trace') {
+    trace.write(`@@JSC2JS_FUNCTION_BEGIN ${JSON.stringify({ key, label })}`);
+    // Keep marker ordering stable relative to V8's native bytecode printer.
+    // In particular, GUI Electron stdout can remain fully buffered after
+    // freopen(), so a marker must reach the shared CRT FILE* before invoking
+    // either debug intrinsic.
+    trace.flush();
+  }
   try {
     info = %GetBytecode(fn);
   } catch (error) {
     report.functions.push({ key, label, status: 'get-bytecode-error', error: String(error && error.message || error) });
-    if (emit === 'trace') console.log(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`);
+    if (emit === 'trace') trace.write(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: 'error' })}`);
     return;
   }
-  if (emit === 'trace') console.log(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: info === undefined ? 'no-bytecode' : 'ok' })}`);
+  if (emit === 'trace') {
+    trace.flush();
+    trace.write(`@@JSC2JS_FUNCTION_END ${JSON.stringify({ key, status: info === undefined ? 'no-bytecode' : 'ok' })}`);
+  }
   if (info === undefined) {
     report.functions.push({ key, label, status: 'no-bytecode' });
     return;
@@ -429,14 +547,17 @@ function dumpFunction(key, label, fn, report, emit) {
     constantPoolLength: info.constant_pool.length
   });
   if (emit !== 'trace') return;
-  console.log(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: info.constant_pool.length })}`);
+  trace.write(`@@JSC2JS_CONSTANTS_BEGIN ${JSON.stringify({ key, count: info.constant_pool.length })}`);
+  trace.flush();
   for (let index = 0; index < info.constant_pool.length; index += 1) {
-    console.log(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`);
+    trace.write(`@@JSC2JS_CONSTANT_INDEX ${JSON.stringify({ key, index })}`);
+    trace.flush();
     // V8's native printer can represent trusted internal objects without
     // reflecting on them through JavaScript (which is unsafe on modern V8).
     %DebugPrint(info.constant_pool[index]);
+    trace.flush();
   }
-  console.log(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
+  trace.write(`@@JSC2JS_CONSTANTS_END ${JSON.stringify({ key })}`);
 }
 
 function loadWrapper(filename, context) {
@@ -496,6 +617,11 @@ function discoverReturnedFunctions(context, initialFunctions, timeout, observati
       );
       const found = [];
       collectFunctions(context.__jsc2js_discovery_result, `${entry.label}()`, new Set(), found);
+      args.forEach((argument, index) => {
+        collectFunctions(
+          argument, `${entry.label}(argument${index})`, new Set(), found
+        );
+      });
       for (const child of found) {
         pending.push({ ...child, depth: entry.depth + 1 });
         discoveredFunctions.push(child);
@@ -508,7 +634,7 @@ function discoverReturnedFunctions(context, initialFunctions, timeout, observati
   return { discovered, functions: discoveredFunctions };
 }
 
-function processFile(filename, options, ordinal, processType) {
+function processFile(filename, options, ordinal, processType, trace) {
   const absolute = path.resolve(filename);
   const report = {
     file: absolute,
@@ -527,7 +653,7 @@ function processFile(filename, options, ordinal, processType) {
     if (options.mode === 'verify') return report;
 
     const rootKey = `${ordinal}-root`;
-    dumpFunction(rootKey, `${path.basename(absolute)}:$wrapper`, wrapper, report, options.emit);
+    dumpFunction(rootKey, `${path.basename(absolute)}:$wrapper`, wrapper, report, options.emit, trace);
     if (options.mode === 'root') return report;
 
     const { moduleRecord, callbacks } = runModuleWrapper(
@@ -548,9 +674,7 @@ function processFile(filename, options, ordinal, processType) {
       dumpFunction(
         `${ordinal}-${safeKey(entry.label)}`,
         `${path.basename(absolute)}:${entry.label}`,
-        entry.fn,
-        report,
-        options.emit
+        entry.fn, report, options.emit, trace
       );
     }
     report.exportFunctionCount = functions.length;
@@ -571,12 +695,13 @@ function main() {
     return;
   }
   v8.setFlagsFromString('--no-lazy --no-flush-bytecode');
+  const trace = createTraceSink(options.traceFile);
   const started = new Date().toISOString();
   // This Node-mode invocation uses Electron's browser/main V8 snapshot.
   // Renderer caches must be routed through electron_renderer_verify_*.cjs,
   // whose hidden analysis window provides the actual renderer snapshot.
   const results = options.files.map((file, index) => {
-    const browser = processFile(file, options, index + 1, 'browser');
+    const browser = processFile(file, options, index + 1, 'browser', trace);
     browser.processType = 'browser';
     return browser;
   });
@@ -585,6 +710,7 @@ function main() {
     started,
     runtime: { electron: process.versions.electron, v8: process.versions.v8, node: process.versions.node },
     mode: options.mode,
+    traceFile: options.traceFile ? path.resolve(options.traceFile) : null,
     accepted: results.filter(result => result.status === 'accepted').length,
     failed: results.filter(result => result.status === 'error').length,
     results
@@ -599,5 +725,12 @@ if (require.main === module) main();
 module.exports = {
   cacheForRuntime,
   createSandbox,
-  runModuleWrapper
+  runModuleWrapper,
+  // Exposed for the hermetic extractor regression tests. These helpers never
+  // deserialize or execute a target cache by themselves.
+  createInertValue,
+  collectFunctions,
+  discoverReturnedFunctions,
+  createTraceSink,
+  parseArguments
 };
