@@ -128,6 +128,18 @@ def parse_marker_trace(path: Path) -> list[tuple[str, list[str], list[str]]]:
             raise ValueError(f"mismatched function marker {key} in {path}")
         if end.get("status") != "ok":
             continue
+        # Electron's --print-bytecode printer can emit lazy compilation of
+        # unrelated Node/bootstrap functions while %GetBytecode is running.
+        # The intrinsic's requested function is the final explicitly headed
+        # `%GetBytecode:` block before our matching end marker.  Retaining the
+        # preceding noise mixes unrelated instruction streams into View8.
+        markers = [
+            position for position, line in enumerate(disassembly)
+            if line.strip() == "%GetBytecode:"
+        ]
+        if not markers:
+            raise ValueError(f"function marker {key} has no %GetBytecode block in {path}")
+        disassembly = disassembly[markers[-1]:]
         if index >= len(lines) or not lines[index].startswith(constants_begin_prefix):
             raise ValueError(f"missing constant-pool marker for {key} in {path}")
         pool_meta = json.loads(lines[index][len(constants_begin_prefix):])

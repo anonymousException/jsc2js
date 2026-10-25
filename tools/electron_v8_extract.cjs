@@ -130,6 +130,46 @@ function createInertValue(label, observations) {
   return proxy;
 }
 
+function createInertCallbackChain(label, observations, callbacks) {
+  let chain;
+  const target = function inertChainTarget() { return chain; };
+  const capture = (method, handlers) => {
+    for (const handler of handlers) {
+      if (typeof handler === 'function') {
+        callbacks.push({ kind: `${label}.${method}`, callback: handler, args: [] });
+      }
+    }
+    return chain;
+  };
+  chain = new Proxy(target, {
+    get(_target, property) {
+      if (property === 'then' || property === 'catch' || property === 'finally') {
+        return (...handlers) => capture(String(property), handlers);
+      }
+      if (property === Symbol.toPrimitive) return () => 0;
+      if (property === Symbol.toStringTag) return 'JSC2JSInertChain';
+      if (property === 'toString') return () => `[JSC2JS inert callback chain ${label}]`;
+      return chain;
+    },
+    set(_target, property) {
+      observations.stubWrites.push(`${label}.${String(property)}`);
+      return true;
+    },
+    apply() {
+      observations.stubCalls.push(label);
+      return chain;
+    },
+    construct() {
+      observations.stubCalls.push(`new ${label}`);
+      return chain;
+    },
+    has() { return false; }
+  });
+  INERT_VALUES.add(target);
+  INERT_VALUES.add(chain);
+  return chain;
+}
+
 function analysisRoot(filename) {
   const normalized = path.resolve(filename);
   const marker = `${path.sep}app.asar.unpacked${path.sep}`;
@@ -177,16 +217,43 @@ function createKoffiStub(observations) {
   });
 }
 
-function createElectronStub(root, observations) {
+function createElectronStub(root, observations, callbacks = []) {
   const inert = createInertValue('electron', observations);
-  const app = Object.freeze({
-    getAppPath: () => root,
-    getPath: () => root,
-    isPackaged: true,
-    whenReady: () => Promise.resolve(),
-    on() {}, once() {}, quit() {}, exit(code) { observations.exitCalls.push(code); },
-    commandLine: Object.freeze({ appendSwitch() {} })
+  const appTarget = createInertValue('electron.app', observations);
+  const commandLine = createInertValue('electron.app.commandLine', observations);
+  const readyChain = createInertCallbackChain('electron.app.whenReady', observations, callbacks);
+  let app;
+  const captureEventHandler = (kind, event, callback, args) => {
+    if (typeof callback === 'function') {
+      callbacks.push({ kind: `${kind}.${String(event)}`, callback, args });
+    }
+    return app;
+  };
+  // Electron's `app` surface is intentionally open-ended across Electron
+  // versions.  Preserve the few values that affect deterministic module
+  // initialization, record lifecycle handlers, and make all other methods
+  // inert.  A fixed Object literal caused otherwise generic extraction to
+  // stop at harmless calls such as app.setName() before startup closures had
+  // been materialized.
+  app = new Proxy(appTarget, {
+    get(_target, property) {
+      if (property === 'getAppPath' || property === 'getPath') return () => root;
+      if (property === 'isPackaged') return true;
+      if (property === 'whenReady') return () => readyChain;
+      if (property === 'on' || property === 'once') {
+        return (event, callback, ...args) => captureEventHandler(property, event, callback, args);
+      }
+      if (property === 'quit') return () => { observations.exitCalls.push('quit'); };
+      if (property === 'exit') return code => { observations.exitCalls.push(code); };
+      if (property === 'commandLine') return commandLine;
+      return appTarget[property];
+    },
+    set(_target, property) {
+      observations.stubWrites.push(`electron.app.${String(property)}`);
+      return true;
+    }
   });
+  INERT_VALUES.add(app);
   return Object.freeze({
     app,
     shell: Object.freeze({ openPath: async () => '' }),
@@ -254,7 +321,7 @@ function createSandbox(filename, observations, processType) {
   return vm.createContext(sandbox, { name: `jsc2js:${path.basename(filename)}` });
 }
 
-function makeRequire(filename, observations) {
+function makeRequire(filename, observations, callbacks) {
   const root = analysisRoot(filename);
   const readonlyFs = createReadOnlyFs(root, observations);
   const readonlyFsPromises = Object.freeze({
@@ -279,7 +346,7 @@ function makeRequire(filename, observations) {
     if (label === 'node:fs/promises' || label === 'fs/promises') return readonlyFsPromises;
     if (label === 'node:path' || label === 'path') return path;
     if (label === 'node:crypto' || label === 'crypto') return crypto;
-    if (label === 'electron') return createElectronStub(root, observations);
+    if (label === 'electron') return createElectronStub(root, observations, callbacks);
     if (label === 'koffi') return createKoffiStub(observations);
     return createInertValue(`require(${label})`, observations);
   };
@@ -385,7 +452,9 @@ function runModuleWrapper(context, wrapper, filename, timeout, observations) {
   const moduleRecord = { exports: {} };
   context.__jsc2js_wrapper = wrapper;
   context.__jsc2js_module = moduleRecord;
-  context.__jsc2js_require = makeRequire(filename, observations);
+  context.__jsc2js_require = makeRequire(
+    filename, observations, context.__jsc2js_callbacks || []
+  );
   context.__jsc2js_filename = filename.replace(/\.jsc$/i, '');
   context.__jsc2js_dirname = path.dirname(filename);
   vm.runInContext(

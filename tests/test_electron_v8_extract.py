@@ -6,6 +6,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXTRACTOR = REPO_ROOT / "tools" / "electron_v8_extract.cjs"
 RENDER_MAIN = REPO_ROOT / "tools" / "electron_renderer_verify_main.cjs"
 RENDER_PRELOAD = REPO_ROOT / "tools" / "electron_renderer_verify_preload.cjs"
+RENDER_EXTRACT_MAIN = REPO_ROOT / "tools" / "electron_renderer_extract_main.cjs"
+RENDER_EXTRACT_PRELOAD = REPO_ROOT / "tools" / "electron_renderer_extract_preload.cjs"
 INSPECTOR_LOCALS = REPO_ROOT / "tools" / "electron_v8_inspector_locals.cjs"
 
 
@@ -23,6 +25,8 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("%DebugPrint", source)
         self.assertIn("createReadOnlyFs", source)
         self.assertIn("createKoffiStub", source)
+        self.assertIn("captureEventHandler", source)
+        self.assertIn("electron.app", source)
         self.assertIn("discoverReturnedFunctions", source)
         self.assertIn("skipped-async", source)
         self.assertIn("node:fs/promises", source)
@@ -46,6 +50,22 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("key === 'arguments'", collector)
         self.assertNotIn("Object.keys(value)", collector)
 
+    def test_electron_app_stub_is_extensible_without_executing_host_methods(self):
+        source = EXTRACTOR.read_text(encoding="utf-8")
+        start = source.index("function createElectronStub(")
+        end = source.index("function createSandbox(", start)
+        app_stub = source[start:end]
+
+        # New Electron releases add app APIs frequently.  Unknown methods must
+        # stay inert, while event handlers remain recoverable bytecode roots.
+        self.assertIn("new Proxy(appTarget", app_stub)
+        self.assertIn("return appTarget[property]", app_stub)
+        self.assertIn("callbacks.push", app_stub)
+        self.assertIn("createInertCallbackChain", app_stub)
+        self.assertIn("whenReady') return () => readyChain", app_stub)
+        self.assertIn("electron.app.commandLine", app_stub)
+        self.assertNotIn("require('electron')", app_stub)
+
     def test_renderer_verifier_does_not_invoke_the_wrapper(self):
         source = RENDER_PRELOAD.read_text(encoding="utf-8")
         self.assertIn("wrapper is\n// not invoked", source)
@@ -57,6 +77,19 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("show: false", source)
         self.assertIn("jsc2js-renderer-verify-result", source)
         self.assertIn("preload: path.join(__dirname", source)
+
+    def test_renderer_root_extractor_never_invokes_the_wrapper(self):
+        main = RENDER_EXTRACT_MAIN.read_text(encoding="utf-8")
+        preload = RENDER_EXTRACT_PRELOAD.read_text(encoding="utf-8")
+        self.assertIn("show: false", main)
+        self.assertIn("jsc2js-renderer-extract-result", main)
+        self.assertIn("--allow-natives-syntax --print-bytecode", main)
+        self.assertIn("%GetBytecode(wrapper)", preload)
+        self.assertIn("%DebugPrint", preload)
+        self.assertIn("bytecodeInfoKeys", preload)
+        self.assertIn("new Uint8Array(info.bytecode)", preload)
+        self.assertIn("script.runInThisContext()", preload)
+        self.assertNotIn("wrapper(", preload)
 
     def test_inspector_local_enumerator_uses_only_the_isolated_extractor(self):
         source = INSPECTOR_LOCALS.read_text(encoding="utf-8")
@@ -70,6 +103,9 @@ class ElectronV8ExtractorContractTest(unittest.TestCase):
         self.assertIn("runModuleWrapper(context", source)
         self.assertIn("collectTargetOwnProperties", source)
         self.assertIn("seenObjects", source)
+        self.assertIn("__jsc2js_inspector_callbacks", source)
+        self.assertIn("initialized.callbacks", source)
+        self.assertIn("${path.basename(absolute)}:${item.label}", source)
 
 
 if __name__ == "__main__":

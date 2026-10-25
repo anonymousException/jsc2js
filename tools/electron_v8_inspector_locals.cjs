@@ -362,6 +362,13 @@ async function main() {
     }
     if (!initialized.moduleRecord) throw new Error('module record was not created');
     globalThis.__jsc2js_inspector_exports = initialized.moduleRecord.exports;
+    // The isolated extractor retains lifecycle/timer callbacks instead of
+    // scheduling them.  Publish those actual JSFunction objects to Inspector
+    // as additional roots: otherwise a startup handler passed directly to
+    // app.whenReady().then(...) is not reachable from module.exports.
+    globalThis.__jsc2js_inspector_callbacks = (initialized.callbacks || [])
+      .map(entry => entry.callback)
+      .filter(value => typeof value === 'function');
     if (options.discover && report.moduleInitialization === 'completed') {
       const discoveries = materializeZeroArgumentExports(
         context, initialized.moduleRecord, options.timeout
@@ -372,9 +379,16 @@ async function main() {
         .map(item => item.value);
     }
     const exportsRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_exports');
+    const callbacksRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_callbacks');
     const state = { seenFunctions: new Set(), seenObjects: new Set(), functions: new Map() };
     await collectTargetFunction(session, root, '$wrapper', state, rootScriptId);
     await collectTargetExportFunctions(session, exportsRemote, 'exports', state, rootScriptId);
+    for (const callback of await remoteProperties(session, callbacksRemote, true)) {
+      if (!/^\d+$/.test(callback.name) || !callback.value) continue;
+      await collectTargetFunction(
+        session, callback.value, `callback.${callback.name}`, state, rootScriptId
+      );
+    }
     if (options.discover && report.moduleInitialization === 'completed') {
       const discoveredRemote = await evaluate(session, 'globalThis.__jsc2js_inspector_discovered');
       const discovered = await remoteProperties(session, discoveredRemote, true);
@@ -395,9 +409,10 @@ async function main() {
     await dumpRemoteFunction(session, 'root', `${path.basename(absolute)}:$wrapper`, root, report);
     let ordinal = 0;
     for (const item of closures) {
+      const closureKey = `closure-${ordinal++}`;
       await dumpRemoteFunction(
-        session, `closure-${ordinal++}`,
-        `${path.basename(absolute)}:closure-${ordinal - 1}`, item.remote, report
+        session, closureKey,
+        `${path.basename(absolute)}:${item.label}`, item.remote, report
       );
     }
     report.status = 'accepted';
@@ -410,6 +425,7 @@ async function main() {
     delete globalThis.__jsc2js_print_value;
     delete globalThis.__jsc2js_inspector_root;
     delete globalThis.__jsc2js_inspector_exports;
+    delete globalThis.__jsc2js_inspector_callbacks;
     delete globalThis.__jsc2js_inspector_discovered;
   }
   if (options.report) fs.writeFileSync(options.report, JSON.stringify(report, null, 2));
