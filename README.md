@@ -107,6 +107,14 @@ moduleInitialization: "interrupted"` 表示已保留初始化前完成物化的�
 `timeoutMs` 限制单个包装器/闭包操作；若需要调整整个隐藏 renderer 的总等待时间，使用独立的
 `hostTimeoutMs`（默认 120000），不要把两者混用。
 
+### Electron 运行时调试
+
+若需要在正在运行的 Electron renderer 中使用 Chrome DevTools，尤其当发行版忽略
+`--remote-debugging-port` 时，可使用独立的
+[Electron Runtime Debug Bridge](tools/electron-runtime-debug/README.md)。它通过
+`webContents.debugger` 提供仅本机可访问的 CDP bridge，并重放隔离 world 的执行上下文。
+该组件与 JSC 提取器独立，不包含任何目标应用的对象或修改逻辑。
+
 ---
 
 ## 说明
@@ -277,6 +285,15 @@ before a host-only initializer failed, while skipping automatic factory
 discovery. `timeoutMs` bounds one wrapper/closure operation. Use the separate
 `hostTimeoutMs` (default 120000) only when the overall hidden-renderer wait
 needs adjustment.
+
+### Electron runtime debugging
+
+For Chrome DevTools access to an already-running Electron renderer—particularly
+when a distribution ignores `--remote-debugging-port`—use the standalone
+[Electron Runtime Debug Bridge](tools/electron-runtime-debug/README.md). It
+exposes a loopback-only CDP bridge through `webContents.debugger` and replays
+isolated-world execution contexts. The component is independent of JSC
+extraction and contains no target-application objects or mutation logic.
 
 ---
 
